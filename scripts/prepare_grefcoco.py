@@ -4,7 +4,7 @@ Prepare gRefCOCO: one record per referring group, split into
 train/val/testA/testB.
 
 Pipeline
-  1. read grefs(unc).json / .p           -> ref_id, image_id, split, sentences, ann_id
+  1. read grefs(unc).json                 -> ref_id, image_id, split, sentences, ann_id
   2. resolve ann_id in COCO instances     -> bbox / segmentation / area / iscrowd
   3. attach the image captions            -> COCO captions_train2014 (5 per image)
   4. write <out_path>/grefcoco_<split>.json, keyed by ref_id
@@ -71,12 +71,15 @@ Notes
   (+27 MB total). 19994/19994 images are covered.
 """
 
+import os
 import argparse
+from csv import Error
 import json
 import pickle
 import sys
 from collections import Counter
 from pathlib import Path
+import errno
 
 SPLITS = ("train", "val", "testA", "testB")
 
@@ -86,22 +89,16 @@ class RowError(RuntimeError):
 
 
 def load_refs(data_path: Path):
-    """Load refs from grefs(unc).json, falling back to grefs(unc).p."""
-    for name in ("grefs(unc).json", "grefs(unc).p"):
-        path = data_path / name
-        if not path.exists():
-            continue
-        if path.suffix == ".json":
-            with open(path, "r", encoding="utf-8") as f:
-                refs = json.load(f)
-        else:
-            with open(path, "rb") as f:
-                refs = pickle.load(f)
-        if not isinstance(refs, list):
-            raise SystemExit(f"{path}: expected a list of refs, got {type(refs).__name__}")
-        print(f"Loaded {len(refs)} refs from {path}")
-        return refs
-    raise SystemExit(f"No grefs(unc).json or grefs(unc).p in {data_path}")
+    """Load refs from grefs(unc).json."""
+    name = "grefs(unc).json"
+    path = data_path / name
+    if not path.exists():
+        raise SystemExit(f"instances file not found: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        refs = json.load(f)
+    print(f"Loaded {len(refs)} refs from {path}")
+    return refs
 
 
 def load_instances(instances_file: Path):
@@ -116,8 +113,9 @@ def load_instances(instances_file: Path):
         if key not in instances:
             raise SystemExit(f"{instances_file}: missing '{key}' key")
 
-    print(f"Loaded {len(instances['images'])} images, "
-          f"{len(instances['annotations'])} annotations from {instances_file}")
+    print(
+        f"Loaded {len(instances['images'])} images, {len(instances['annotations'])} annotations from {instances_file}"
+    )
     return instances
 
 
@@ -142,7 +140,9 @@ def build_lookups(instances):
     """Index annotations and images by id."""
     anns = {a["id"]: a for a in instances["annotations"]}
     imgs = {i["id"]: i for i in instances["images"]}
-    if len(anns) != len(instances["annotations"]) or len(imgs) != len(instances["images"]):
+    if len(anns) != len(instances["annotations"]) or len(imgs) != len(
+        instances["images"]
+    ):
         raise SystemExit("instances file has duplicate image or annotation ids")
     return anns, imgs
 
@@ -163,24 +163,41 @@ def build_ref(ref, anns, imgs, captions):
         if key not in img:
             raise RowError(f"image_id {image_id} has no '{key}' in the instances file")
 
-    sentences = [{"sent_id": s["sent_id"], "sent": s["sent"], "raw": s.get("raw"),
-                  "tokens": s["tokens"]} for s in ref.get("sentences", [])]
+    sentences = [
+        {
+            "sent_id": s["sent_id"],
+            "sent": s["sent"],
+            "raw": s.get("raw"),
+            "tokens": s["tokens"],
+        }
+        for s in ref.get("sentences", [])
+    ]
     if not sentences:
         raise RowError("ref has no sentences")
 
     targets = []
     for ann_id in _as_list(ref["ann_id"]):
         if ann_id == -1:
-            targets.append({"id": -1, "category_id": -1, "bbox": None,
-                            "segmentation": [], "area": 0, "iscrowd": 0, "empty": True})
+            targets.append(
+                {
+                    "id": -1,
+                    "category_id": -1,
+                    "bbox": None,
+                    "segmentation": [],
+                    "area": 0,
+                    "iscrowd": 0,
+                    "empty": True,
+                }
+            )
             continue
 
         ann = anns.get(ann_id)
         if ann is None:
             raise RowError(f"ann_id {ann_id} missing from the instances file")
         if ann.get("image_id") != image_id:
-            raise RowError(f"ann_id {ann_id} belongs to image {ann.get('image_id')}, "
-                           f"not {image_id}")
+            raise RowError(
+                f"ann_id {ann_id} belongs to image {ann.get('image_id')}, not {image_id}"
+            )
 
         bbox = ann["bbox"]
         if not isinstance(bbox, list) or len(bbox) != 4:
@@ -188,13 +205,22 @@ def build_ref(ref, anns, imgs, captions):
 
         segmentation = ann.get("segmentation", [])
         if isinstance(segmentation, dict):
-            segmentation = {"size": segmentation.get("size"),
-                            "counts": segmentation.get("counts")}
+            segmentation = {
+                "size": segmentation.get("size"),
+                "counts": segmentation.get("counts"),
+            }
 
-        targets.append({"id": ann_id, "category_id": ann["category_id"],
-                        "bbox": bbox, "segmentation": segmentation,
-                        "area": ann.get("area", 0), "iscrowd": ann.get("iscrowd", 0),
-                        "empty": False})
+        targets.append(
+            {
+                "id": ann_id,
+                "category_id": ann["category_id"],
+                "bbox": bbox,
+                "segmentation": segmentation,
+                "area": ann.get("area", 0),
+                "iscrowd": ann.get("iscrowd", 0),
+                "empty": False,
+            }
+        )
 
     return {
         "ref_id": ref_id,
@@ -229,9 +255,10 @@ def prepare_split(refs, anns, imgs, captions, split_name, strict=True):
     num_tgt = sum(len(r["targets"]) for r in records)
     num_empty = sum(1 for r in records for t in r["targets"] if t["empty"])
     num_no_cap = sum(1 for r in records if not r["captions"])
-    print(f"  {len(records)} refs / {num_expr} expressions / {num_tgt} targets "
-          f"({num_empty} empty), {dropped} dropped"
-          + (f", {num_no_cap} refs without captions" if num_no_cap else ""))
+    print(
+        f"  {len(records)} refs / {num_expr} expressions / {num_tgt} targets ({num_empty} empty), {dropped} dropped"
+        + (f", {num_no_cap} refs without captions" if num_no_cap else "")
+    )
     return records
 
 
@@ -245,67 +272,88 @@ def write_json(path: Path, payload):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare gRefCOCO split files")
-    parser.add_argument("--data_path", required=True,
-                        help="Directory with grefs(unc).json (and annotations/)")
-    parser.add_argument("--out_path", required=True,
-                        help="Output directory for grefcoco_<split>.json")
+    parser.add_argument(
+        "--data_path",
+        required=True,
+        help="Directory with grefs(unc).json (and annotations/)",
+    )
+    parser.add_argument(
+        "--out_path", required=True, help="Output directory for grefcoco_<split>.json"
+    )
     parser.add_argument("--splits", nargs="+", default=list(SPLITS), choices=SPLITS)
-    parser.add_argument("--instances_file", default=None,
-                        help="COCO instances file; defaults to <data_path>/instances.json, "
-                             "else <data_path>/annotations/instances_train2014.json")
-    parser.add_argument("--captions_file", default=None,
-                        help="COCO captions file; defaults to "
-                             "<data_path>/annotations/captions_train2014.json")
-    parser.add_argument("--image_root", default=None,
-                        help="Image directory recorded in the output as 'image_root'")
-    parser.add_argument("--no-strict", dest="strict", action="store_false",
-                        help="Skip refs with bad annotations instead of aborting")
+    parser.add_argument(
+        "--instances_file",
+        default=None,
+        help="COCO instances file; defaults to <data_path>/instances.json, else <data_path>/annotations/instances_train2014.json",
+    )
+    parser.add_argument(
+        "--captions_file",
+        default=None,
+        help="COCO captions file; defaults to <data_path>/annotations/captions_train2014.json",
+    )
+    parser.add_argument(
+        "--image_root",
+        default=None,
+        help="Image directory recorded in the output as 'image_root'",
+    )
+    parser.add_argument(
+        "--no-strict",
+        dest="strict",
+        action="store_false",
+        help="Skip refs with bad annotations instead of aborting",
+    )
     args = parser.parse_args()
 
     data_path, out_path = Path(args.data_path), Path(args.out_path)
     out_path.mkdir(parents=True, exist_ok=True)
 
     refs = load_refs(data_path)
-    instances_file = Path(args.instances_file) if args.instances_file else next(
-        (p for p in (data_path / "instances.json",
-                     data_path / "annotations/instances_train2014.json") if p.exists()),
-        data_path / "instances.json")
-    captions_file = Path(args.captions_file) if args.captions_file \
+    instances_file = (
+        Path(args.instances_file)
+        if args.instances_file
+        else data_path / "annotations/instances_train2014.json"
+    )
+    captions_file = (
+        Path(args.captions_file)
+        if args.captions_file
         else data_path / "annotations/captions_train2014.json"
+    )
 
     instances = load_instances(instances_file)
     captions = load_captions(captions_file)
 
-    needed_images = {ref["image_id"] for ref in refs}
-    uncovered = needed_images - set(captions)
-    if len(uncovered) == len(needed_images):
-        raise SystemExit(f"{captions_file} covers none of the {len(needed_images)} "
-                         f"referenced images; wrong captions file?")
-    if uncovered:
-        print(f"Warning: {len(uncovered)} of {len(needed_images)} referenced images "
-              f"have no caption")
-
     split_counts = Counter(ref["split"] for ref in refs)
     for split_name in args.splits:
         if split_counts.get(split_name, 0) == 0:
-            raise SystemExit(f"Split '{split_name}' has no refs. Available: "
-                             f"{dict(sorted(split_counts.items()))}")
+            raise SystemExit(
+                f"Split '{split_name}' has no refs. Available: {dict(sorted(split_counts.items()))}"
+            )
 
     anns, imgs = build_lookups(instances)
 
     written = []
     for split_name in args.splits:
         try:
-            records = prepare_split(refs, anns, imgs, captions, split_name,
-                                    strict=args.strict)
+            records = prepare_split(
+                refs, anns, imgs, captions, split_name, strict=args.strict
+            )
         except RowError as e:
-            print(f"Error in split '{split_name}': {e}\n"
-                  f"Rerun with --no-strict to drop bad refs.", file=sys.stderr)
+            print(
+                f"Error in split '{split_name}': {e}\nRerun with --no-strict to drop bad refs.",
+                file=sys.stderr,
+            )
             raise SystemExit(1)
 
         out_file = out_path / f"grefcoco_{split_name}.json"
-        write_json(out_file, {"split": split_name, "num_refs": len(records),
-                              "image_root": args.image_root, "refs": records})
+        write_json(
+            out_file,
+            {
+                "split": split_name,
+                "num_refs": len(records),
+                "image_root": args.image_root,
+                "refs": records,
+            },
+        )
         print(f"  wrote {out_file}")
         written.append(out_file)
 
