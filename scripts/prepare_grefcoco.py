@@ -308,11 +308,12 @@ def main():
     out_path.mkdir(parents=True, exist_ok=True)
 
     refs = load_refs(data_path)
-    instances_file = (
-        Path(args.instances_file)
-        if args.instances_file
-        else data_path / "annotations/instances_train2014.json"
-    )
+    if args.instances_file:
+        instances_file = Path(args.instances_file)
+    else:
+        instances_file = data_path / "instances.json"
+        if not instances_file.exists():
+            instances_file = data_path / "annotations/instances_train2014.json"
     captions_file = (
         Path(args.captions_file)
         if args.captions_file
